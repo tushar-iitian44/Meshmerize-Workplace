@@ -1,0 +1,46 @@
+PID controller and PWM
+void calculatePID() {
+  const float weights[6] = {-2.5, -1.5, -0.5, 0.5, 1.5, 2.5};
+  float error = 0.0;
+  float sum = 0.0;
+  bool lineDetected = false;
+
+  for (int i = 0; i < 6; i++) {
+    int raw = analogRead(sensorPins[i]);
+
+    int denom = sensorMax[i] - sensorMin[i];
+    float norm = 0.0;
+
+    if (denom != 0) {
+      norm = (raw - sensorMin[i]) / (float)denom;
+      norm = constrain(norm, 0.0, 1.0);
+    }
+
+    error += weights[i] * norm;
+    sum += norm;
+  }
+
+  if (sum > 0.1) {
+    error /= sum;
+    lineDetected = true;
+  } else {
+    error = previousError;
+  }
+
+  if (lineDetected) {
+    integral += error;   // optionally: integral += error * dt;
+  }
+
+  // Anti-windup
+  integral = constrain(integral, -100.0, 100.0);
+
+  derivative = error - previousError;
+  float correction = Kp * error + Ki * integral + Kd * derivative;
+  previousError = error;
+
+  int leftSpeed  = constrain(baseSpeed + correction, 0, 255);
+  int rightSpeed = constrain(baseSpeed - correction, 0, 255);
+
+  analogWrite(ENA, leftSpeed);
+  analogWrite(ENB, rightSpeed);
+}
