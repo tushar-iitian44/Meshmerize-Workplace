@@ -8,10 +8,10 @@
   The Serial pattern is printed A0 -> A5, therefore it is the reverse of
   the physical left-to-right order.  For example, 011110 is centred.
 
-  At every junction this sketch uses the LSRB rule:
-    Left -> Straight -> Right -> Back
-  A Back decision is a 180 degree turn.  A 000000 pattern that persists for
-  DEAD_END_CONFIRM_MS is also treated as a dead end and causes a Back turn.
+  At every junction this sketch uses the LSR rule:
+    Left -> Straight -> Right
+  It NEVER makes a 180 degree/U-turn.  A persistent 000000 pattern is treated
+  as a lost line and safely stops both motors instead.
 
   IMPORTANT: This is for a WHITE line on a dark floor.  It assumes a white
   surface reads BELOW SENSOR_THRESHOLD.  Tune that one value on the actual
@@ -78,10 +78,9 @@ const unsigned long JUNCTION_ADVANCE_MS = 90;
 const unsigned long TURN_MIN_MS = 105;
 const unsigned long TURN_TIMEOUT_MS = 1500;
 
-// A true dead end produces 000000.  This short confirmation avoids reacting
-// to one bad sensor frame.  If the robot regularly loses a valid line, raise
-// this value or improve SENSOR_THRESHOLD / PID tuning.
-const unsigned long DEAD_END_CONFIRM_MS = 70;
+// A 000000 pattern must persist for this long before the robot stops.  This
+// filters a single bad reading.  It does NOT cause a U-turn.
+const unsigned long LINE_LOST_CONFIRM_MS = 70;
 
 const unsigned long CENTER_STABLE_MS = 250;
 
@@ -109,7 +108,7 @@ enum RobotState {
   CONFIRM_JUNCTION,
   ADVANCE_JUNCTION,
   TURNING,
-  CONFIRM_DEAD_END,
+  CONFIRM_LINE_LOST,
   FAULT_STOP
 };
 
@@ -137,10 +136,9 @@ unsigned long stateStartTime = 0;
 unsigned long lastJunctionTime = 0;
 float controlDt = CONTROL_INTERVAL_MS / 1000.0f;
 
-// -1 = left, +1 = right, +2 = 180 degree back turn.
+// -1 = left, +1 = right.  No other turn direction is allowed.
 int requestedTurn = 0;
 bool turnLeftOldLine = false;
-float lastError = 0.0f;
 bool junctionSawLeft = false;
 bool junctionSawRight = false;
 
@@ -240,14 +238,13 @@ bool looksLikeJunction(const SensorFrame &sample) {
   return sample.leftChoice || sample.rightChoice;
 }
 
-char chooseLSRB(bool leftAvailable, bool straightAvailable,
-                bool rightAvailable) {
-  // Fixed L -> S -> R -> B priority.  Do not reorder these tests unless the
-  // maze rule itself changes.
+char chooseLSR(bool leftAvailable, bool straightAvailable,
+               bool rightAvailable) {
+  // Fixed L -> S -> R priority.  There is deliberately no Back/U-turn case.
   if (leftAvailable) return 'L';
   if (straightAvailable) return 'S';
   if (rightAvailable) return 'R';
-  return 'B';
+  return 'N';  // no usable L/S/R route
 }
 
 // ==================================================
@@ -259,9 +256,8 @@ const char *stateName() {
     case FOLLOW_LINE:      return startupAlign ? "STARTUP ALIGNING" : "PID TRACKING";
     case CONFIRM_JUNCTION: return "JUNCTION CONFIRM";
     case ADVANCE_JUNCTION: return "JUNCTION CHECK S/R";
-    case TURNING:          return requestedTurn == -1 ? "TURN LEFT" :
-                                 requestedTurn == 1 ? "TURN RIGHT" : "TURN BACK";
-    case CONFIRM_DEAD_END: return "DEAD END CONFIRM";
+    case TURNING:          return requestedTurn == -1 ? "TURN LEFT" : "TURN RIGHT";
+    case CONFIRM_LINE_LOST:return "LINE LOST CONFIRM";
     case FAULT_STOP:       return "FAULT STOP";
     default:               return "UNKNOWN";
   }
@@ -326,11 +322,11 @@ void resolveJunction() {
   junctionSawLeft = junctionSawLeft || sensors.leftChoice;
   junctionSawRight = junctionSawRight || sensors.rightChoice;
 
-  // The first part of LSRB is unambiguous: if the left branch is present,
+  // The first part of LSR is unambiguous: if the left branch is present,
   // take it immediately.  For S-versus-R, the robot must move beyond the
   // wide paint before it can know whether "straight" really exits.
-  if (chooseLSRB(junctionSawLeft, false, junctionSawRight) == 'L') {
-    Serial.println(F("LSRB choice: L"));
+  if (chooseLSR(junctionSawLeft, false, junctionSawRight) == 'L') {
+    Serial.println(F("LSR choice: L"));
     beginTurn(-1);
   } else {
     stateStartTime = millis();
@@ -346,9 +342,6 @@ void runPid() {
   float error = sensors.error;
 
   if (error > -ERROR_DEADBAND && error < ERROR_DEADBAND) error = 0.0f;
-
-  // Keep the last useful direction for Serial diagnostics and PID recovery.
-  if (error > 0.15f || error < -0.15f) lastError = error;
 
   if (startupAlign) {
     if (sensors.pattern == 0b011110 && error > -0.2f && error < 0.2f) {
@@ -393,12 +386,15 @@ void runPid() {
 void runTurn() {
   unsigned long elapsed = millis() - stateStartTime;
 
-  // Pivot turns use reverse on one wheel and forward on the other.  This is
-  // why the code needs signed L298N control rather than forward-only PWM.
+  // Pivot turns use reverse on one wheel and forward on the other.  Only a
+  // 90 degree left or right pivot can be requested; U-turns are not present.
   if (requestedTurn == -1) {
     setMotors(-TURN_PWM, TURN_PWM);       // pivot left
+  } else if (requestedTurn == 1) {
+    setMotors(TURN_PWM, -TURN_PWM);       // pivot right
   } else {
-    setMotors(TURN_PWM, -TURN_PWM);       // pivot right / 180 degree back
+    enterFaultStop(F("invalid turn request"));
+    return;
   }
 
   // At a junction the central sensors begin on white.  Require them to leave
@@ -422,19 +418,22 @@ void runTurn() {
                     requestedTurn == -1 ? TURN_PWM : -TURN_PWM);
 }
 
-void runDeadEndConfirm() {
+void runLineLostConfirm() {
   stopMotors();
 
   if (lineVisible(sensors)) {
-    // It was a brief dropout, not a dead end.
+    // It was a brief dropout, not a lost line.
     resetPid(sensors.error);
     state = FOLLOW_LINE;
     return;
   }
 
-  if (millis() - stateStartTime >= DEAD_END_CONFIRM_MS) {
-    Serial.println(F("DEAD END: executing Back turn"));
-    beginTurn(2);
+  if (millis() - stateStartTime >= LINE_LOST_CONFIRM_MS) {
+    // Intentionally stop.  A sensor array alone cannot reliably distinguish
+    // a true dead end from a missing/dirty section of line, so a U-turn here
+    // would make the robot behave unpredictably.
+    enterFaultStop(F("line lost: motors stopped; no U-turn is permitted"));
+    return;
   }
 
   printDebug(0.0f, 0, 0);
@@ -453,23 +452,20 @@ void runJunctionAdvance() {
     return;
   }
 
-  char choice = chooseLSRB(junctionSawLeft, centredLine(sensors),
-                           junctionSawRight);
+  char choice = chooseLSR(junctionSawLeft, centredLine(sensors),
+                          junctionSawRight);
   if (choice == 'L') {
-    Serial.println(F("LSRB choice: L"));
+    Serial.println(F("LSR choice: L"));
     beginTurn(-1);
   } else if (choice == 'S') {
-    Serial.println(F("LSRB choice: S"));
+    Serial.println(F("LSR choice: S"));
     resetPid(sensors.error);
     state = FOLLOW_LINE;
   } else if (choice == 'R') {
-    Serial.println(F("LSRB choice: R"));
+    Serial.println(F("LSR choice: R"));
     beginTurn(1);
   } else {
-    // No left was seen, the forward exit disappeared, and no right branch was
-    // detected: this junction is a dead end relative to the arrival path.
-    Serial.println(F("LSRB choice: B"));
-    beginTurn(2);
+    enterFaultStop(F("junction has no L/S/R exit"));
   }
 }
 
@@ -492,8 +488,8 @@ void setup() {
   lastControlTime = millis();
   lastDebugTime = millis();
 
-  Serial.println(F("Meshmerize PID LSRB maze follower ready"));
-  Serial.println(F("Priority: Left -> Straight -> Right -> Back"));
+  Serial.println(F("Meshmerize PID LSR maze follower ready"));
+  Serial.println(F("Priority: Left -> Straight -> Right (no U-turn)"));
 }
 
 void loop() {
@@ -517,8 +513,8 @@ void loop() {
     return;
   }
 
-  if (state == CONFIRM_DEAD_END) {
-    runDeadEndConfirm();
+  if (state == CONFIRM_LINE_LOST) {
+    runLineLostConfirm();
     return;
   }
 
@@ -529,7 +525,7 @@ void loop() {
 
   if (!lineVisible(sensors)) {
     stateStartTime = now;
-    state = CONFIRM_DEAD_END;
+    state = CONFIRM_LINE_LOST;
     stopMotors();
     printDebug(0.0f, 0, 0);
     return;
