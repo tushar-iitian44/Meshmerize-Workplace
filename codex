@@ -20,6 +20,7 @@ const int TURN_SPEED = 130;
 const unsigned long TURN_MIN_TIME_MS = 150;
 const unsigned long TURN_TIMEOUT_MS = 1200;
 const unsigned long TURN_SETTLE_MS = 80;
+const int REACQUIRE_READINGS = 3;
 
 bool turnPatternLocked = false;
 
@@ -45,15 +46,15 @@ void readSensors() {
   }
 }
 
-// Signed speed: positive is forward, negative is reverse.
-// If a positive command runs a motor backward, swap that motor's
-// HIGH/LOW assignments here.
+// Signed speed: positive uses the same direction as the original sketch.
+// Negative reverses that motor.
 void setMotorsSigned(int leftSpeed, int rightSpeed) {
   leftSpeed = constrain(leftSpeed, -255, 255);
   rightSpeed = constrain(rightSpeed, -255, 255);
 
   digitalWrite(IN1, leftSpeed >= 0 ? HIGH : LOW);
   digitalWrite(IN2, leftSpeed >= 0 ? LOW : HIGH);
+
   digitalWrite(IN3, rightSpeed >= 0 ? HIGH : LOW);
   digitalWrite(IN4, rightSpeed >= 0 ? LOW : HIGH);
 
@@ -61,7 +62,7 @@ void setMotorsSigned(int leftSpeed, int rightSpeed) {
   analogWrite(ENB, abs(rightSpeed));
 }
 
-// Forward-only motor command used by the original line-following logic.
+// Forward-only motor command for the original line-following behavior.
 void setMotors(int leftSpeed, int rightSpeed) {
   setMotorsSigned(
     constrain(leftSpeed, 0, 255),
@@ -88,82 +89,96 @@ float calculateError() {
   return sum / count;
 }
 
-String getPattern() {
-  String pattern = "";
-
-  for (int i = 0; i < Num_Sensor; i++) {
-    pattern += (Sensor_Value[i] < SENSOR_THRESHOLD) ? '0' : '1';
-  }
-
-  return pattern;
-}
-
 bool middleSensorsSeeWhite() {
   // Middle sensors are A3 and A2: indexes 2 and 3.
   return Sensor_Value[2] < SENSOR_THRESHOLD ||
          Sensor_Value[3] < SENSOR_THRESHOLD;
 }
 
-// direction: -1 pivots left; +1 pivots right.
-// Returns true if the middle sensors reacquire the white line.
-bool turn90(int direction) {
+void printPattern() {
+  for (int i = 0; i < Num_Sensor; i++) {
+    Serial.print(Sensor_Value[i] < SENSOR_THRESHOLD ? '0' : '1');
+  }
+}
+
+// direction: -1 = left pivot; +1 = right pivot.
+// Stops when the middle sensors reacquire the white line or when time runs out.
+bool pivotUntilLineReacquired(int direction) {
   if (direction < 0) {
     setMotorsSigned(-TURN_SPEED, TURN_SPEED);
-    Serial.println("TURN LEFT");
+    Serial.println("PIVOT LEFT");
   } else {
     setMotorsSigned(TURN_SPEED, -TURN_SPEED);
-    Serial.println("TURN RIGHT");
+    Serial.println("PIVOT RIGHT");
   }
 
-  unsigned long startTime = millis();
+  const unsigned long startTime = millis();
+  int consecutiveReadings = 0;
 
   while (millis() - startTime < TURN_TIMEOUT_MS) {
     readSensors();
 
-    // Allow the robot to rotate away from the current edge reading
-    // before checking for the line under the middle sensors.
-    if (millis() - startTime >= TURN_MIN_TIME_MS &&
-        middleSensorsSeeWhite()) {
-      setMotors(0, 0);
-      delay(TURN_SETTLE_MS);
-      readSensors();
+    if (millis() - startTime >= TURN_MIN_TIME_MS) {
+      if (middleSensorsSeeWhite()) {
+        consecutiveReadings++;
+      } else {
+        consecutiveReadings = 0;
+      }
 
-      Serial.println("TURN COMPLETE - LINE REACQUIRED");
-      return true;
+      if (consecutiveReadings >= REACQUIRE_READINGS) {
+        setMotors(0, 0);
+        delay(TURN_SETTLE_MS);
+        readSensors();
+        Serial.println("LINE REACQUIRED");
+        return true;
+      }
     }
+
+    delay(10);
   }
 
   setMotors(0, 0);
-  Serial.println("TURN TIMEOUT - LINE NOT REACQUIRED");
+  Serial.println("TURN TIMEOUT - STOPPED");
   return false;
 }
 
 void loop() {
   readSensors();
-  String pattern = getPattern();
 
-  // Sensor order is left-to-right:
-  // 100000 = white on the leftmost sensor -> turn left.
-  // 000001 = white on the rightmost sensor -> turn right.
-  bool leftEdgeOnly = (pattern == "100000");
-  bool rightEdgeOnly = (pattern == "000001");
-  bool isTurnPattern = leftEdgeOnly || rightEdgeOnly;
+  // Pattern bits are printed left-to-right, matching Sensor_Pins.
+  bool leftPivotPattern =
+    Sensor_Value[0] < SENSOR_THRESHOLD &&
+    Sensor_Value[1] >= SENSOR_THRESHOLD &&
+    Sensor_Value[2] >= SENSOR_THRESHOLD &&
+    Sensor_Value[3] >= SENSOR_THRESHOLD &&
+    Sensor_Value[4] >= SENSOR_THRESHOLD &&
+    Sensor_Value[5] >= SENSOR_THRESHOLD;  // 100000
 
-  if (!isTurnPattern) {
-    // Re-arm once the robot leaves the edge-only pattern.
+  bool rightPivotPattern =
+    Sensor_Value[0] >= SENSOR_THRESHOLD &&
+    Sensor_Value[1] >= SENSOR_THRESHOLD &&
+    Sensor_Value[2] >= SENSOR_THRESHOLD &&
+    Sensor_Value[3] >= SENSOR_THRESHOLD &&
+    Sensor_Value[4] >= SENSOR_THRESHOLD &&
+    Sensor_Value[5] < SENSOR_THRESHOLD;   // 000001
+
+  bool isPivotPattern = leftPivotPattern || rightPivotPattern;
+
+  if (!isPivotPattern) {
+    // Re-arm after leaving the exact pivot-trigger pattern.
     turnPatternLocked = false;
   }
 
-  if (isTurnPattern && !turnPatternLocked) {
+  if (isPivotPattern && !turnPatternLocked) {
     turnPatternLocked = true;
 
-    if (leftEdgeOnly) {
-      turn90(-1);
+    if (leftPivotPattern) {
+      pivotUntilLineReacquired(-1);
     } else {
-      turn90(+1);
+      pivotUntilLineReacquired(+1);
     }
   } else if (turnPatternLocked) {
-    // Hold stopped if a turn timed out and the edge pattern remains.
+    // Prevent repeated pivots while the same edge pattern remains.
     setMotors(0, 0);
   } else {
     float error = calculateError();
@@ -195,7 +210,7 @@ void loop() {
   }
 
   Serial.print("Pattern: ");
-  Serial.print(pattern);
+  printPattern();
   Serial.print(" | Error: ");
   Serial.println(calculateError());
 
