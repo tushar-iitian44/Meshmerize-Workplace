@@ -83,6 +83,9 @@ if(White_Count >=5){
   if(error>0){
     setMotors(0,100);
   }
+  if(error ==0){
+    setMotors(180,0);
+  }
 }
   // 3. Choose the motor commandsa
   else{
