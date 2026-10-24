@@ -77,6 +77,7 @@ void loop() {
   float error = calculateError();
 if(White_Count >=5){
   Serial.println(White_Count);
+  delay(100);
   if(error<0){
     setMotors(100,0);
   }
@@ -86,6 +87,7 @@ if(White_Count >=5){
   if(error ==0){
     setMotors(180,0);
   }
+  delay(1500);
 }
   // 3. Choose the motor commandsa
   else{
@@ -117,9 +119,7 @@ if(White_Count >=5){
   // 4. Display the sensor pattern for debugging
   Serial.print("Pattern: ");
   for (int i = 0; i < Num_Sensor; i++) {
-    Serial.print(
-      Sensor_Value[i] < SENSOR_THRESHOLD ? '0' : '1'
-    );
+    Serial.print(Sensor_Value[i] < SENSOR_THRESHOLD ? '0' : '1');
   }
 
   Serial.print(" | Error: ");
