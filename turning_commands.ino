@@ -77,7 +77,6 @@ void loop() {
   float error = calculateError();
 if(White_Count >=5){
   Serial.println(White_Count);
-  delay(100);
   if(error<0){
     setMotors(100,0);
   }
